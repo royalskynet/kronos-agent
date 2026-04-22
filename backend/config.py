@@ -10,6 +10,7 @@ from .utils import CONFIG_DIR, clamp, clean_bool, current_run_date, now_iso, rea
 
 
 TRADING_SETTINGS_PATH = CONFIG_DIR / "trading_agent.json"
+TELEGRAM_SETTINGS_PATH = CONFIG_DIR / "telegram.json"
 DASHBOARD_SETTINGS_PATH = CONFIG_DIR / "dashboard_settings.json"
 FIXED_UNIVERSE_PATH = CONFIG_DIR / "fixed_universe.json"
 CANDIDATE_SOURCE_PATH = CONFIG_DIR / "candidate_source.py"
@@ -98,6 +99,13 @@ DEFAULT_PROVIDER_SETTINGS = {
     "maxOutputTokens": 1200,
     "anthropicVersion": "2023-06-01",
     "customHeaders": {},
+}
+
+
+DEFAULT_TELEGRAM_SETTINGS = {
+    "enabled": False,
+    "bot_token": "",
+    "chat_id": "",
 }
 
 
@@ -504,6 +512,30 @@ def write_llm_provider(patch: dict[str, Any]) -> dict[str, Any]:
         "customHeaders": patch.get("customHeaders") if isinstance(patch.get("customHeaders"), dict) else current["customHeaders"],
     }
     write_json(LLM_PROVIDER_PATH, next_payload)
+    return next_payload
+
+
+def read_telegram_settings() -> dict[str, Any]:
+    payload = _with_default_file(TELEGRAM_SETTINGS_PATH, DEFAULT_TELEGRAM_SETTINGS)
+    return {
+        **deepcopy(DEFAULT_TELEGRAM_SETTINGS),
+        **payload,
+        "enabled": clean_bool(payload.get("enabled"), False),
+        "bot_token": str(payload.get("bot_token") or "").strip(),
+        "chat_id": str(payload.get("chat_id") or "").strip(),
+    }
+
+
+def write_telegram_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    current = read_telegram_settings()
+    next_payload = {
+        **current,
+        **patch,
+        "enabled": clean_bool(patch.get("enabled"), current["enabled"]),
+        "bot_token": str(patch.get("bot_token", current["bot_token"])).strip(),
+        "chat_id": str(patch.get("chat_id", current["chat_id"])).strip(),
+    }
+    write_json(TELEGRAM_SETTINGS_PATH, next_payload)
     return next_payload
 
 

@@ -1,14 +1,17 @@
 {
   "version": 1,
   "updated": "2026-04-22",
-  "preset": "gpt",
+  "preset": "custom",
   "apiStyle": "openai",
-  "model": "gpt-5.4-mini",
-  "baseUrl": "https://api.openai.com/v1",
-  "apiKey": "",
+  "model": "nvidia/llama-3.1-nemotron-ultra-253b-v1:free",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "apiKey": "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",
   "timeoutSeconds": 45,
   "temperature": 0.2,
   "maxOutputTokens": 1200,
   "anthropicVersion": "2023-06-01",
-  "customHeaders": {}
+  "customHeaders": {
+    "HTTP-Referer": "https://github.com/royalskynet/kronos-agent",
+    "X-Title": "kronos-agent"
+  }
 }

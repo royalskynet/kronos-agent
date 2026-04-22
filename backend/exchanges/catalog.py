@@ -63,6 +63,21 @@ EXCHANGE_CATALOG: dict[str, dict[str, Any]] = {
         "defaultLeverageMax": 100,
         "notes": "即将支持 Gate.io 合约接口。",
     },
+    "bitget": {
+        "id": "bitget",
+        "label": "Bitget",
+        "implemented": True,
+        "marketSupported": True,
+        "tradingSupported": True,
+        "market": "usdt_futures",
+        "defaultBaseUrl": "https://api.bitget.com",
+        "apiKeyPlaceholder": "Bitget API key",
+        "apiSecretPlaceholder": "Bitget API secret",
+        "apiPassphrasePlaceholder": "Bitget API passphrase",
+        "requiresPassphrase": True,
+        "defaultLeverageMax": 125,
+        "notes": "Bitget USDT-M 永续合约行情与实盘接口。需填写 API Passphrase。",
+    },
 }
 
 EXCHANGE_CATALOG["binance"]["apiPassphrasePlaceholder"] = ""

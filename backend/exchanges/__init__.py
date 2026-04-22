@@ -12,10 +12,12 @@ def _ensure_gateways() -> None:
     if _GATEWAYS:
         return
     from .binance import BinanceGateway
+    from .bitget import BitgetGateway
     from .bybit import BybitGateway
     from .okx import OkxGateway
 
     _GATEWAYS["binance"] = BinanceGateway()
+    _GATEWAYS["bitget"] = BitgetGateway()
     _GATEWAYS["bybit"] = BybitGateway()
     _GATEWAYS["okx"] = OkxGateway()
 

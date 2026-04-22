@@ -3,7 +3,7 @@
   "updated": "2026-04-22",
   "description": "Python-only local trading agent settings.",
   "mode": "paper",
-  "activeExchange": "binance",
+  "activeExchange": "bitget",
   "server": {
     "host": "127.0.0.1",
     "port": 8788
@@ -20,7 +20,7 @@
   "paperFeesBps": 4,
   "allowShorts": true,
   "paperTrading": {
-    "enabled": false
+    "enabled": true
   },
   "liveTrading": {
     "enabled": false

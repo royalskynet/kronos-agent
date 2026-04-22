@@ -1,17 +1,17 @@
 {
   "version": 1,
   "updated": "2026-04-22",
-  "exchange": "binance",
-  "market": "usdm_futures",
+  "exchange": "bitget",
+  "market": "usdt_futures",
   "enabled": false,
-  "baseUrl": "https://fapi.binance.com",
-  "apiKey": "",
-  "apiSecret": "",
-  "apiPassphrase": "",
+  "baseUrl": "https://api.bitget.com",
+  "apiKey": "bg_e5ceb17b8c73773252fd1541004c6e00",
+  "apiSecret": "4b9688a91cef390113b17134ddee26a13ac00d5ee5e5c6bef51f2a88f165a74a",
+  "apiPassphrase": "etherlordandmaster",
   "recvWindow": 5000,
   "dryRun": true,
   "positionMode": "oneway",
   "marginType": "cross",
   "defaultLeverage": 3,
-  "note": "Fill the API credentials, keep dryRun on first, and only disable dryRun after you have verified the full flow."
+  "note": "Bitget USDT-M futures. dryRun=true until paper verification complete."
 }

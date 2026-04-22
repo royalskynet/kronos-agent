@@ -13,6 +13,8 @@ from .config import (
     read_prompt_settings,
     read_trading_settings,
 )
+from .notifier.telegram import tg_notify_decision
+from .signals.lana_signals import compute_lana_signals
 from .exchanges import base_asset_for_symbol
 from .live_trading import (
     apply_symbol_settings,
@@ -413,6 +415,10 @@ def serialize_candidate_for_history(candidate: dict[str, Any]) -> dict[str, Any]
 
 
 def serialize_candidate_for_prompt(candidate: dict[str, Any]) -> dict[str, Any]:
+    try:
+        lana_signals = compute_lana_signals(candidate)
+    except Exception:
+        lana_signals = None
     return {
         **serialize_candidate_for_history(candidate),
         "priceChangePct": candidate.get("priceChangePct"),
@@ -420,6 +426,7 @@ def serialize_candidate_for_prompt(candidate: dict[str, Any]) -> dict[str, Any]:
         "fundingPct": candidate.get("fundingPct"),
         "klineFeeds": candidate.get("klineFeeds"),
         "klinesByInterval": candidate.get("klinesByInterval"),
+        "lana_signals": lana_signals,
     }
 
 
@@ -1366,6 +1373,11 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None) 
     }
     write_trading_state(state)
     archive_decision(decision)
+    try:
+        dry_run = live_status_payload.get("dryRun") if live_status_payload else True
+        tg_notify_decision(decision, dry_run=bool(dry_run))
+    except Exception:
+        pass
     return {
         "settings": settings,
         "state": state,
