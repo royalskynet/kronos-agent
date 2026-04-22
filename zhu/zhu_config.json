@@ -1,0 +1,47 @@
+{
+  "wallet_address": "5o9dF1kYSyjPZdr2ys69kecPpqdUrErgszHFxsdXrDMt",
+  "chain": "sol",
+  "live": false,
+  "equity_usd": 100.0,
+  "stake_pct_per_trade": 0.05,
+  "max_concurrent_positions": 5,
+  "daily_loss_halt_pct": -0.20,
+
+  "scan_poll_sec": 60,
+  "hold_poll_sec": 60,
+  "signal_size": 30,
+
+  "entry_min_hunters": 3,
+  "entry_min_mc": 5000,
+  "entry_max_mc": 2000000,
+  "entry_min_holder": 50,
+  "entry_max_age_min": 60,
+  "pumpfun_graduate_min_mc": 80000,
+  "entry_min_liq_usd": 5000,
+  "jito_tip_lamports": 1000,
+  "solana_rpc_url": "https://api.mainnet-beta.solana.com",
+
+  "exit_peak_drawdown_pct": 0.50,
+  "exit_time_hours": 72,
+  "exit_hard_stop_pct": -0.30,
+  "exit_scale_out_multiplier": 10.0,
+  "exit_scale_out_fraction": 0.50,
+
+  "swap_slippage_pct": 10,
+
+  "extra_gate_enabled": true,
+  "max_risk_level": "medium",
+  "max_top10_holder_pct": 0.85,
+  "max_dev_rug_count": 0,
+  "vol_surge_multiplier": 3.0,
+  "vol_surge_enabled": false,
+
+  "surf_brief_path": "/Users/51mini/binance-trading-agent/zhu/surf_brief.json",
+  "surf_brief_ttl_hours": 6,
+  "surf_priority_min_hunters": 3,
+  "surf_priority_max_mc": 2000000,
+
+
+  "tg_bot_token": "8771443421:AAHq3z-raG5AMdoItbPNsEfaiamWtFrEtNQ",
+  "tg_chat_id": "7852197786"
+}

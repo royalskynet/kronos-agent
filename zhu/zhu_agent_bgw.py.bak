@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Zhu Agent — autonomous Solana meme trader modeled on 棍哥 (@lanaaielsa).
+
+Single-process asyncio daemon: scan bgw alpha-signals -> filter fresh high-
+conviction candidates -> security gate -> quote -> (dry_run: simulate |
+live: sign+send) -> track peak -> exit on trailing drawdown / time stop /
+scale-out ladder. Zero LLM calls.
+
+Config: zhu_config.json in same dir. Safety: `live=false` default.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BGW = os.path.expanduser(
+    "~/.openclaw/workspace/.agents/skills/bitget-wallet-skill/scripts/bitget-wallet-agent-api.py"
+)
+ORDER_CLI = os.path.expanduser(
+    "~/.openclaw/workspace/.agents/skills/bitget-wallet-skill/scripts/order_make_sign_send.py"
+)
+DERIVE_CLI = os.path.join(HERE, "zhu_derive_sol.py")
+DB = os.path.join(HERE, "zhu_state.db")
+LOG = os.path.join(HERE, "zhu_agent.log")
+CONFIG = os.path.join(HERE, "zhu_config.json")
+
+SOL_NATIVE_CONTRACT = "11111111111111111111111111111111"
+SOL_SYMBOL = "SOL"
+
+# transient-fail cache: ca -> retry_after_epoch
+_QUOTE_FAIL_SKIP: dict = {}
+QUOTE_FAIL_SKIP_SEC = 1800
+
+
+# ---------- helpers ----------
+def log(msg: str):
+    ts = datetime.now().isoformat(timespec="seconds")
+    line = f"[{ts}] {msg}\n"
+    sys.stdout.write(line)
+    sys.stdout.flush()
+    with open(LOG, "a") as f:
+        f.write(line)
+
+
+def load_config() -> dict:
+    with open(CONFIG) as f:
+        return json.load(f)
+
+
+def today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# ---------- db ----------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS positions (
+    ca TEXT PRIMARY KEY,
+    symbol TEXT,
+    name TEXT,
+    open_ts INTEGER,
+    open_price REAL,
+    size_usd REAL,
+    size_tokens REAL,
+    peak_price REAL,
+    scaled_out INTEGER DEFAULT 0,
+    status TEXT,
+    close_ts INTEGER,
+    close_price REAL,
+    pnl_usd REAL,
+    exit_reason TEXT,
+    open_tx TEXT,
+    close_tx TEXT
+);
+CREATE TABLE IF NOT EXISTS candidates (
+    ca TEXT PRIMARY KEY,
+    first_seen INTEGER,
+    symbol TEXT,
+    payload TEXT
+);
+CREATE TABLE IF NOT EXISTS daily_pnl (
+    date TEXT PRIMARY KEY,
+    realized_usd REAL DEFAULT 0,
+    entries INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0
+);
+"""
+
+
+def init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB, check_same_thread=False, isolation_level=None)
+    conn.executescript(SCHEMA)
+    return conn
+
+
+# ---------- bgw wrappers (subprocess) ----------
+async def _run(cmd: list, timeout: int = 30) -> tuple[int, str, str]:
+    p = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        p.kill()
+        await p.communicate()
+        return 124, "", "timeout"
+    return p.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+async def bgw_alpha_signals(chain: str, size: int) -> dict | None:
+    rc, out, err = await _run(
+        [sys.executable, BGW, "alpha-signals", "--chain", chain, "--size", str(size)]
+    )
+    if rc != 0:
+        log(f"alpha-signals rc={rc} err={err[:200]}")
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        log(f"alpha-signals json fail stdout={out[:200]!r}")
+        return None
+
+
+async def bgw_check_swap_token(from_chain, from_contract, from_sym,
+                               to_chain, to_contract, to_sym) -> dict | None:
+    rc, out, _ = await _run(
+        [sys.executable, BGW, "check-swap-token",
+         "--from-chain", from_chain, "--from-contract", from_contract,
+         "--from-symbol", from_sym,
+         "--to-chain", to_chain, "--to-contract", to_contract,
+         "--to-symbol", to_sym],
+        timeout=20,
+    )
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+async def bgw_quote(wallet, chain, from_contract, from_sym, from_amount,
+                   to_chain, to_contract, to_sym, slippage) -> dict | None:
+    """Retry up to 3x on transient upstream 'System error' responses."""
+    for attempt in range(3):
+        rc, out, _ = await _run(
+            [sys.executable, BGW, "quote",
+             "--from-address", wallet,
+             "--from-chain", chain, "--from-symbol", from_sym,
+             "--from-contract", from_contract, "--from-amount", str(from_amount),
+             "--to-chain", to_chain, "--to-symbol", to_sym,
+             "--to-contract", to_contract,
+             "--slippage", str(slippage)],
+            timeout=20,
+        )
+        if rc != 0:
+            await asyncio.sleep(2)
+            continue
+        try:
+            resp = json.loads(out)
+        except json.JSONDecodeError:
+            await asyncio.sleep(2)
+            continue
+        msg = (resp.get("msg") or "").lower()
+        if resp.get("error_code", 0) == 0:
+            return resp
+        if "system error" in msg or "try again" in msg:
+            await asyncio.sleep(2)
+            continue
+        return resp  # non-transient bgw error — return so caller logs it
+    return None
+
+
+async def bgw_simple_kline(chain, contract, period="1m", size=5) -> dict | None:
+    rc, out, _ = await _run(
+        [sys.executable, BGW, "simple-kline",
+         "--chain", chain, "--contract", contract,
+         "--period", period, "--size", str(size),
+         "--no-kol", "--no-smart-money", "--no-developer"],
+        timeout=15,
+    )
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+async def bgw_search_tokens_v3(keyword, chain="sol", limit=1) -> dict | None:
+    rc, out, _ = await _run(
+        [sys.executable, BGW, "search-tokens-v3",
+         "--keyword", keyword, "--chain", chain, "--limit", str(limit)],
+        timeout=15,
+    )
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+# ---------- surf brief ----------
+_SURF_CACHE: dict = {"loaded_at": 0, "data": None}
+
+
+def load_surf_brief(cfg) -> dict | None:
+    path = cfg.get("surf_brief_path")
+    if not path or not os.path.exists(path):
+        return None
+    st = os.stat(path)
+    age_h = (time.time() - st.st_mtime) / 3600
+    if age_h > cfg.get("surf_brief_ttl_hours", 6):
+        return None
+    if _SURF_CACHE["loaded_at"] == st.st_mtime and _SURF_CACHE["data"]:
+        return _SURF_CACHE["data"]
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        _SURF_CACHE["loaded_at"] = st.st_mtime
+        _SURF_CACHE["data"] = data
+        return data
+    except Exception as e:
+        log(f"surf brief load fail: {e}")
+        return None
+
+
+def is_surf_priority(ca: str, cfg) -> bool:
+    brief = load_surf_brief(cfg)
+    if not brief:
+        return False
+    for c in (brief.get("candidates") or []):
+        if c.get("ca") == ca:
+            return True
+    return False
+
+
+# ---------- extra filter gate ----------
+async def extra_gate_pass(cand: dict, cfg) -> bool:
+    """Run search-tokens-v3 + optional kline vol surge check.
+    Gates: risk_level <= max, dev_rug_coin_count <= max, top10 holder pct < max.
+    """
+    if not cfg.get("extra_gate_enabled", True):
+        return True
+    ca = cand["contract"]
+    sym = cand.get("symbol", "")
+    resp = await bgw_search_tokens_v3(sym or ca, "sol", 3)
+    if not resp or resp.get("status") != 0:
+        # no data: let it pass (alpha-signals already qualified it)
+        return True
+    # find exact CA match
+    tok = None
+    for t in (resp.get("data", {}).get("list") or []):
+        if t.get("contract") == ca:
+            tok = t
+            break
+    if not tok:
+        return True
+
+    risk_order = {"low": 0, "medium": 1, "high": 2, "unknown": 1}
+    risk = (tok.get("risk_level") or "unknown").lower()
+    max_risk = cfg.get("max_risk_level", "medium")
+    if risk_order.get(risk, 1) > risk_order.get(max_risk, 1):
+        log(f"GATE risk_level={risk} > {max_risk} ca={ca} sym={sym}")
+        return False
+
+    dev_rug = tok.get("dev_rug_coin_count") or 0
+    if dev_rug > cfg.get("max_dev_rug_count", 0):
+        log(f"GATE dev_rug={dev_rug} ca={ca} sym={sym}")
+        return False
+
+    top10 = tok.get("top10_holder_percent") or 0
+    if top10 > cfg.get("max_top10_holder_pct", 0.70):
+        log(f"GATE top10={top10:.2f} > {cfg['max_top10_holder_pct']} ca={ca} sym={sym}")
+        return False
+
+    if cfg.get("vol_surge_enabled", False):
+        k = await bgw_simple_kline("sol", ca, "15m", 6)
+        if k and k.get("status") == 0:
+            lst = (k.get("data") or {}).get("list") or []
+            if len(lst) >= 5:
+                vols = []
+                for c in lst:
+                    v = c.get("volume") or c.get("vol") or 0
+                    try:
+                        vols.append(float(v))
+                    except Exception:
+                        vols.append(0)
+                avg_prev = sum(vols[:-1]) / max(1, len(vols) - 1)
+                last = vols[-1]
+                ratio = last / avg_prev if avg_prev > 0 else 0
+                if ratio < cfg.get("vol_surge_multiplier", 3.0):
+                    log(f"GATE vol_surge ratio={ratio:.1f}x ca={ca}")
+                    return False
+    return True
+
+
+# ---------- telegram ----------
+def tg_send(cfg: dict, text: str):
+    token, chat = cfg.get("tg_bot_token"), cfg.get("tg_chat_id")
+    if not token or not chat:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": chat, "text": text, "parse_mode": "Markdown",
+        "disable_web_page_preview": "true",
+    }).encode()
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10).read()
+    except Exception as e:
+        log(f"tg send fail: {e}")
+
+
+# ---------- entry filter ----------
+def entry_ok(s: dict, cfg: dict) -> bool:
+    ca = s.get("contract", "") or ""
+    priority = is_surf_priority(ca, cfg)
+    min_hunters = cfg["surf_priority_min_hunters"] if priority else cfg["entry_min_hunters"]
+    max_mc = cfg["surf_priority_max_mc"] if priority else cfg["entry_max_mc"]
+
+    if s.get("signal_value", 0) < min_hunters:
+        return False
+    mc = s.get("market_cap", 0) or 0
+    if mc < cfg["entry_min_mc"] or mc > max_mc:
+        return False
+    # pump.fun bonding-curve CAs (suffix "pump") under graduate threshold
+    # cannot be routed by bgw — skip until graduated to Raydium (~$69k MC).
+    graduate_mc = cfg.get("pumpfun_graduate_min_mc", 80000)
+    if ca.lower().endswith("pump") and mc < graduate_mc:
+        return False
+    if (s.get("holder", 0) or 0) < cfg["entry_min_holder"]:
+        return False
+    open_time = s.get("open_time", 0) or 0
+    if open_time:
+        if time.time() - open_time > cfg["entry_max_age_min"] * 60:
+            return False
+    return True
+
+
+def daily_halt(conn, cfg) -> bool:
+    row = conn.execute("SELECT realized_usd FROM daily_pnl WHERE date=?",
+                       (today_utc(),)).fetchone()
+    realized = row[0] if row else 0.0
+    return realized <= cfg["equity_usd"] * cfg["daily_loss_halt_pct"]
+
+
+def open_positions_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM positions WHERE status='open'"
+                        ).fetchone()[0]
+
+
+def record_daily(conn, realized: float, won: bool):
+    d = today_utc()
+    conn.execute(
+        "INSERT INTO daily_pnl(date, realized_usd, entries, wins, losses) "
+        "VALUES(?,?,0,?,?) ON CONFLICT(date) DO UPDATE SET "
+        "realized_usd=realized_usd+excluded.realized_usd, "
+        "wins=wins+excluded.wins, losses=losses+excluded.losses",
+        (d, realized, 1 if won else 0, 0 if won else 1),
+    )
+
+
+# ---------- entry ----------
+async def try_entry(conn, cfg, cand: dict):
+    ca = cand["contract"]
+    sym = cand.get("symbol", "?")
+    # dedupe
+    if conn.execute("SELECT 1 FROM positions WHERE ca=?", (ca,)).fetchone():
+        return
+    # skip CAs whose quote failed recently (bgw has no liquidity route)
+    retry_after = _QUOTE_FAIL_SKIP.get(ca, 0)
+    if retry_after > time.time():
+        return
+    if open_positions_count(conn) >= cfg["max_concurrent_positions"]:
+        return
+    if daily_halt(conn, cfg):
+        log(f"daily halt active — skip entry {sym} {ca}")
+        return
+
+    # security gate
+    sec = await bgw_check_swap_token(
+        "sol", SOL_NATIVE_CONTRACT, SOL_SYMBOL,
+        "sol", ca, sym,
+    )
+    if sec is None:
+        log(f"security check fail (no response) ca={ca}")
+        return
+    forbidden = False
+    for t in (sec.get("data", {}).get("list") or []):
+        for item in (t.get("checkTokenList") or []):
+            if item.get("waringType") == "forbidden-buy" and t.get("contract") == ca:
+                forbidden = True
+    if forbidden:
+        log(f"security FORBIDDEN ca={ca} sym={sym}")
+        return
+
+    # extended gate: risk_level + dev_rug + concentration (+optional vol surge)
+    if not await extra_gate_pass(cand, cfg):
+        return
+
+    # size in SOL
+    stake_usd = cfg["equity_usd"] * cfg["stake_pct_per_trade"]
+    sol_price = 150.0  # rough fallback; real bgw quote converts internally
+    from_amount_sol = round(stake_usd / sol_price, 6)
+
+    # quote for price estimate
+    q = await bgw_quote(
+        cfg["wallet_address"], "sol", SOL_NATIVE_CONTRACT, SOL_SYMBOL,
+        from_amount_sol, "sol", ca, sym, cfg["swap_slippage_pct"],
+    )
+    if not q or q.get("error_code", 0) != 0:
+        msg = q.get("msg") if q else "no response"
+        _QUOTE_FAIL_SKIP[ca] = time.time() + QUOTE_FAIL_SKIP_SEC
+        log(f"quote fail ca={ca} sym={sym}: {msg} (skip {QUOTE_FAIL_SKIP_SEC//60}m)")
+        return
+    quotes = q.get("data", {}).get("quoteResults", []) or []
+    if not quotes:
+        log(f"no quoteResults ca={ca}")
+        return
+    best = quotes[0]
+    out_amount = float(best.get("outAmount", 0))
+    if out_amount <= 0:
+        log(f"quote outAmount=0 ca={ca}")
+        return
+    est_price = stake_usd / out_amount  # usd per token
+
+    mode = "LIVE" if cfg["live"] else "DRY"
+    log(f"{mode} ENTRY {sym} ca={ca} size=${stake_usd:.2f} tokens={out_amount:.4f} price={est_price:.8f}")
+
+    if cfg["live"]:
+        # derive sol priv key to temp file
+        r = await _run([sys.executable, DERIVE_CLI], timeout=15)
+        if r[0] != 0:
+            log(f"derive sol key fail: {r[2][:200]}")
+            return
+        keyfile = r[1].strip()
+        try:
+            # merged make-sign-send
+            rc, out, err = await _run([
+                sys.executable, ORDER_CLI,
+                "--private-key-file-sol", keyfile,
+                "--from-address", cfg["wallet_address"],
+                "--to-address", cfg["wallet_address"],
+                "--from-chain", "sol", "--from-contract", SOL_NATIVE_CONTRACT,
+                "--from-symbol", SOL_SYMBOL,
+                "--to-chain", "sol", "--to-contract", ca, "--to-symbol", sym,
+                "--from-amount", str(from_amount_sol),
+                "--slippage", str(cfg["swap_slippage_pct"]),
+                "--market", best.get("market", {}).get("id", ""),
+                "--protocol", best.get("market", {}).get("protocol", ""),
+            ], timeout=90)
+            if rc != 0:
+                log(f"LIVE entry send fail ca={ca}: rc={rc} err={err[:200]}")
+                return
+            try:
+                resp = json.loads(out)
+            except json.JSONDecodeError:
+                resp = {"raw": out[:500]}
+            open_tx = resp.get("data", {}).get("orderId") or resp.get("data", {}).get("txHash") or ""
+        finally:
+            # defensive cleanup; order_sign.py should have deleted it
+            try:
+                os.unlink(keyfile)
+            except FileNotFoundError:
+                pass
+    else:
+        open_tx = "DRY_RUN"
+
+    conn.execute(
+        "INSERT INTO positions(ca, symbol, name, open_ts, open_price, size_usd, "
+        "size_tokens, peak_price, status, open_tx) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (ca, sym, cand.get("name"), int(time.time()), est_price,
+         stake_usd, out_amount, est_price, "open", open_tx),
+    )
+    surf_tag = " [SURF]" if is_surf_priority(ca, cfg) else ""
+    tg_send(cfg, (
+        f"Zhu {'LIVE' if cfg['live'] else 'DRY'} ENTRY{surf_tag}\n"
+        f"{sym} ({cand.get('name','?')})\n"
+        f"CA: `{ca}`\n"
+        f"Size: ${stake_usd:.2f} | Tokens: {out_amount:.4f}\n"
+        f"Entry px: {est_price:.8f}\n"
+        f"Hunters 5m: {cand.get('signal_value')} | MC: ${cand.get('market_cap',0):,.0f}"
+    ))
+
+
+# ---------- exit ----------
+async def try_exit(conn, cfg, pos: sqlite3.Row):
+    ca = pos["ca"]
+    sym = pos["symbol"]
+    age_hours = (time.time() - pos["open_ts"]) / 3600.0
+
+    k = await bgw_simple_kline("sol", ca, "1m", size=3)
+    cur_price = None
+    if k and k.get("status") == 0:
+        lst = (k.get("data") or {}).get("list") or []
+        if lst:
+            try:
+                cur_price = float(lst[-1].get("close", 0))
+            except Exception:
+                cur_price = None
+    if cur_price is None or cur_price <= 0:
+        log(f"kline miss {sym} ca={ca}")
+        return
+
+    peak = max(pos["peak_price"] or cur_price, cur_price)
+    if peak != pos["peak_price"]:
+        conn.execute("UPDATE positions SET peak_price=? WHERE ca=?", (peak, ca))
+
+    entry = pos["open_price"] or cur_price
+    profit_mult = cur_price / entry if entry else 1.0
+    drawdown_from_peak = (peak - cur_price) / peak if peak else 0.0
+
+    reason = None
+    if age_hours > cfg["exit_time_hours"] and profit_mult < 2.0:
+        reason = "time_stop"
+    elif (cur_price / entry - 1.0) <= cfg["exit_hard_stop_pct"]:
+        reason = "hard_stop"
+    elif drawdown_from_peak >= cfg["exit_peak_drawdown_pct"]:
+        reason = f"trailing_peak_{drawdown_from_peak*100:.0f}%"
+    elif not pos["scaled_out"] and profit_mult >= cfg["exit_scale_out_multiplier"]:
+        # scale out half, keep running
+        sell_tokens = pos["size_tokens"] * cfg["exit_scale_out_fraction"]
+        log(f"SCALE_OUT {sym} at {profit_mult:.1f}x sell {sell_tokens:.4f} tokens")
+        # (TODO: execute partial swap back to SOL — live path not yet implemented)
+        conn.execute(
+            "UPDATE positions SET size_tokens=size_tokens-?, scaled_out=1 WHERE ca=?",
+            (sell_tokens, ca),
+        )
+        tg_send(cfg, f"Zhu SCALE-OUT\n{sym} {profit_mult:.1f}x — sold {cfg['exit_scale_out_fraction']*100:.0f}% back to SOL")
+        return
+
+    if not reason:
+        return
+
+    # final sell
+    pnl = (cur_price - entry) * pos["size_tokens"]
+    mode = "LIVE" if cfg["live"] else "DRY"
+    log(f"{mode} EXIT {sym} ca={ca} reason={reason} mult={profit_mult:.2f}x pnl=${pnl:+.2f}")
+
+    close_tx = "DRY_RUN"
+    if cfg["live"]:
+        # execute sell — swap all remaining tokens back to SOL
+        # (build quote args: from=token, to=SOL)
+        # left as same flow as entry but inverted; intentionally simple:
+        r = await _run([sys.executable, DERIVE_CLI], timeout=15)
+        if r[0] == 0:
+            keyfile = r[1].strip()
+            try:
+                rc, out, err = await _run([
+                    sys.executable, ORDER_CLI,
+                    "--private-key-file-sol", keyfile,
+                    "--from-address", cfg["wallet_address"],
+                    "--to-address", cfg["wallet_address"],
+                    "--from-chain", "sol", "--from-contract", ca,
+                    "--from-symbol", sym,
+                    "--to-chain", "sol", "--to-contract", SOL_NATIVE_CONTRACT,
+                    "--to-symbol", SOL_SYMBOL,
+                    "--from-amount", str(pos["size_tokens"]),
+                    "--slippage", str(cfg["swap_slippage_pct"]),
+                ], timeout=90)
+                if rc == 0:
+                    try:
+                        resp = json.loads(out)
+                        close_tx = resp.get("data", {}).get("orderId") or ""
+                    except Exception:
+                        pass
+                else:
+                    log(f"LIVE exit send fail ca={ca}: rc={rc} err={err[:200]}")
+            finally:
+                try:
+                    os.unlink(keyfile)
+                except FileNotFoundError:
+                    pass
+
+    conn.execute(
+        "UPDATE positions SET status='closed', close_ts=?, close_price=?, "
+        "pnl_usd=?, exit_reason=?, close_tx=? WHERE ca=?",
+        (int(time.time()), cur_price, pnl, reason, close_tx, ca),
+    )
+    record_daily(conn, pnl, pnl > 0)
+    tg_send(cfg, (
+        f"Zhu {'LIVE' if cfg['live'] else 'DRY'} EXIT\n"
+        f"{sym} CA: `{ca}`\n"
+        f"Reason: {reason} | {profit_mult:.2f}x\n"
+        f"PnL: ${pnl:+.2f}"
+    ))
+
+
+# ---------- loops ----------
+async def scan_loop(conn, cfg):
+    while True:
+        try:
+            resp = await bgw_alpha_signals(cfg["chain"], cfg["signal_size"])
+            if resp and resp.get("status") == 0:
+                lst = (resp.get("data") or {}).get("list", []) or []
+                matched = 0
+                for s in lst:
+                    ca = s.get("contract")
+                    if not ca:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO candidates(ca, first_seen, symbol, payload) "
+                        "VALUES(?,?,?,?)",
+                        (ca, int(time.time()), s.get("symbol"), json.dumps(s)),
+                    )
+                    if entry_ok(s, cfg):
+                        await try_entry(conn, cfg, s)
+                        matched += 1
+                log(f"scan tick fetched={len(lst)} matched={matched}")
+        except Exception as e:
+            log(f"scan error: {type(e).__name__}: {e}")
+        await asyncio.sleep(cfg["scan_poll_sec"])
+
+
+async def hold_loop(conn, cfg):
+    while True:
+        try:
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE status='open'"
+            ).fetchall()
+            for row in rows:
+                await try_exit(conn, cfg, row)
+        except Exception as e:
+            log(f"hold error: {type(e).__name__}: {e}")
+        await asyncio.sleep(cfg["hold_poll_sec"])
+
+
+async def main():
+    cfg = load_config()
+    conn = init_db()
+    conn.row_factory = sqlite3.Row
+    mode = "LIVE" if cfg["live"] else "DRY"
+    log(
+        f"zhu_agent start mode={mode} wallet={cfg['wallet_address']} "
+        f"equity=${cfg['equity_usd']} stake_pct={cfg['stake_pct_per_trade']*100:.0f}% "
+        f"max_pos={cfg['max_concurrent_positions']} "
+        f"halt_pct={cfg['daily_loss_halt_pct']*100:.0f}%"
+    )
+    tg_send(cfg, f"Zhu Agent started — {mode} mode, equity ${cfg['equity_usd']}")
+    await asyncio.gather(
+        scan_loop(conn, cfg),
+        hold_loop(conn, cfg),
+    )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("zhu_agent stopped (KeyboardInterrupt)")

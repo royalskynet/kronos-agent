@@ -12,3 +12,4 @@ data/trading-agent/decisions/
 data/trading_agent_state.json
 data/logs/
 logs/
+.env
