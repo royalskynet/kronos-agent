@@ -113,7 +113,7 @@ http://127.0.0.1:8788/trader.html
 
 ---
 
-## 稳定梯子推荐
+## 稳定代理推荐
 [MOJIE](https://mojie.me/#/register?code=6seDUwEZ)
 
 ## 联系方式
